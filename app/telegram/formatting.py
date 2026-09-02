@@ -119,3 +119,72 @@ def format_stale_callback() -> str:
 
 def format_unauthorized() -> str:
     return "⛔ Yetkisiz kullanıcı."
+
+
+def format_found_tickets_message(search: TicketSearch, trains) -> str:
+    """Format found-ticket notification with all eligible trains in one message.
+
+    Includes route, travel date, train name/number, departure time, economy count.
+    """
+    dep_date_display = format_display_date(search.travel_date)
+    route = f"{search.origin_station_name} → {search.destination_station_name}"
+    lines = [
+        "🎫 Bilet bulundu!",
+        "",
+        f"🚉 {route}",
+        f"📅 {dep_date_display}",
+        f"🕐 {search.departure_time_from} – {search.departure_time_to}",
+        "",
+        f"Bulunan seferler ({len(trains)}):",
+    ]
+    for t in trains:
+        # Use train_name if available, fallback to train_number, fallback to id
+        name = t.train_name or t.train_number or str(t.train_id)
+        # Include number if different from name
+        if t.train_number and t.train_number not in name:
+            display_name = f"{name} ({t.train_number})"
+        else:
+            display_name = name
+        lines.append(f"• {display_name} — {t.departure_time} — Ekonomi: {t.economy_available}")
+    lines.extend([
+        "",
+        "👤 1 yolcu • 💺 Sadece ekonomi",
+    ])
+    return "\n".join(lines)
+
+
+def format_expired_message(search: TicketSearch) -> str:
+    """Format expiration notification for ended active search."""
+    dep_date_display = format_display_date(search.travel_date)
+    route = f"{search.origin_station_name} → {search.destination_station_name}"
+    time_range = f"{search.departure_time_from} – {search.departure_time_to}"
+    lines = [
+        "⏰ Arama süresi doldu.",
+        "",
+        f"🚉 {route}",
+        f"📅 {dep_date_display}",
+        f"🕐 {time_range}",
+        "",
+        "Seyahat penceresi geçtiği için aktif araman sonlandırıldı.",
+        "Yeni bir arama başlatmak için /ara kullanabilirsin.",
+    ]
+    return "\n".join(lines)
+
+
+def format_restart_success() -> str:
+    return "✅ Arama yeniden başlatıldı. TCDD 60–90 saniyelik aralıklarla kontrol edilecek."
+
+
+def build_found_keyboard(search_id: int):
+    """Build InlineKeyboard for found ticket: TCDD link + restart callback."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    # TCDD purchase URL – generic; route-aware deep linking can be added later
+    tcdd_url = "https://ebilet.tcddtasimacilik.gov.tr/"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("TCDD'den Bilet Al", url=tcdd_url)],
+            [InlineKeyboardButton("Bileti Alamadım - Tekrar Ara", callback_data=f"restart:{search_id}")],
+        ]
+    )
+    return keyboard
