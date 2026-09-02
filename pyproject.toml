@@ -1,0 +1,20 @@
+[project]
+name = "tcdd-ticket"
+version = "0.1.0"
+description = "TCDD Ticket Finder Bot - spike validation"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+curl = ["curl_cffi>=0.7"]
+test = ["pytest>=8", "httpx", "curl_cffi"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

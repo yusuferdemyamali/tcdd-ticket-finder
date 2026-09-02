@@ -1,0 +1,81 @@
+schema: spec-driven
+
+context: |
+Proje: TCDD Ticket Finder Bot
+
+Python tabanlı, Telegram üzerinden yönetilen kişisel tren bileti takip uygulaması.
+
+MVP:
+
+* Tek kullanıcı
+* Tek aktif arama
+* Tek yolcu
+* Tek yön
+* Kalkış istasyonu, varış istasyonu, tarih ve kalkış saat aralığı alınır
+* TCDD 60-90 saniyelik random aralıklarla sorgulanır
+* Yalnızca normal ekonomi koltuğu dikkate alınır
+* Business ve engelli/özel koltuklar uygunluk sayılmaz
+* Saat aralığındaki tüm uygun seferler tek Telegram mesajında bildirilir
+* Koltuk bulununca arama durur
+* "Bileti Alamadım - Tekrar Ara" ile aynı arama yeniden başlatılabilir
+* Aktif arama varken yeni arama için kullanıcıdan değiştirme onayı alınır
+* Restart sonrası aktif arama SQLite üzerinden devam eder
+* TCDD erişilemezse bir kez uyarı, düzelince recovery bildirimi gönderilir
+
+Teknoloji:
+
+* Python 3.12+
+* python-telegram-bot
+* httpx
+* Gerekirse curl_cffi
+* SQLite
+* Docker
+
+TCDD entegrasyonu undocumented web API üzerinden yapılacaktır.
+Playwright MVP kapsamında değildir.
+
+İlk geliştirme adımı scripts/spike_tcdd.py ile gerçek TCDD API entegrasyonunu doğrulamaktır.
+
+Kritik invariant:
+Bir sefer yalnızca normal economy availability >= 1 ise uygun kabul edilir.
+
+Search state'leri:
+ACTIVE, FOUND, COMPLETED, CANCELLED, EXPIRED
+
+Kullanıcıya Telegram bildirimi başarıyla gönderilmeden search COMPLETED yapılmamalıdır.
+
+MVP dışı:
+
+* Otomatik bilet satın alma
+* TCDD login
+* Otomatik token yenileme
+* Business/engelli koltuğu takibi
+* Multi-user
+* Birden fazla eş zamanlı arama
+* Birden fazla yolcu
+* Web/mobile panel
+* Playwright
+
+rules:
+proposal:
+- Gereksiz kapsam genişletme yapma.
+- MVP dışı özellik ekleme.
+- Mevcut davranışların korunması gereken noktalarını belirt.
+- Belirsiz TCDD davranışlarında varsayım yapmak yerine gerçek API/kodu doğrula.
+
+specs:
+- Requirement'ları açık ve test edilebilir yaz.
+- Normal ekonomi, Business ve engelli koltuğu ayrımını açıkça koru.
+- Hata durumu ile "koltuk yok" durumunu birbirine karıştırma.
+
+design:
+- TCDD entegrasyonunu app/tcdd katmanında izole tut.
+- Telegram, persistence ve TCDD response formatını birbirine bağlama.
+- Gereksiz abstraction ve future-proofing yapma.
+- SQLite kalıcı source of truth olsun.
+
+tasks:
+- Görevleri küçük, sıralı ve doğrulanabilir tut.
+- Önce TCDD API spike'ını tamamla.
+- Her görevde gerekli test/doğrulama adımını belirt.
+- İstek dışı refactor ekleme.
