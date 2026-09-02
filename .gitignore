@@ -1,0 +1,56 @@
+# Secrets / env — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env-venv/
+
+# Testing / tooling caches
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+
+# SQLite / local data
+# DATABASE_PATH local: data/tcdd-ticket.sqlite3, Docker: /data (named volume)
+data/
+*.sqlite3
+*.sqlite
+*.db
+*.db-journal
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

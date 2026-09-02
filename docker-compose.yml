@@ -1,0 +1,20 @@
+services:
+  app:
+    build: .
+    container_name: tcdd-ticket-bot
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_ALLOWED_USER_ID: ${TELEGRAM_ALLOWED_USER_ID}
+      TCDD_TOKEN: ${TCDD_TOKEN}
+      DATABASE_PATH: /data/tcdd-ticket.sqlite3
+      POLL_MIN_SECONDS: ${POLL_MIN_SECONDS:-60}
+      POLL_MAX_SECONDS: ${POLL_MAX_SECONDS:-90}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - tcdd-data:/data
+    restart: unless-stopped
+    # Optional: keep container alive and auto-restart on failure; uses same startup as `python -m app.main` from Dockerfile CMD
+    # No ports, no additional services; single application service per MVP.
+
+volumes:
+  tcdd-data:
