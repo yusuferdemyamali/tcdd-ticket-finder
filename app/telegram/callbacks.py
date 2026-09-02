@@ -48,10 +48,11 @@ class RestartCallbackHandler:
     - Calls restart_search on valid
     """
 
-    def __init__(self, ticket_service, allowed_user_id: int, now_fn=None) -> None:
+    def __init__(self, ticket_service, allowed_user_id: int, now_fn=None, on_search_activated=None) -> None:
         self.ticket_service = ticket_service
         self.allowed_user_id = allowed_user_id
         self._now_fn = now_fn
+        self._on_search_activated = on_search_activated
 
     def _now_dt(self) -> datetime.datetime:
         if self._now_fn is not None:
@@ -116,6 +117,17 @@ class RestartCallbackHandler:
             # Includes conflict (ACTIVE exists), validation, etc.
             await query.message.reply_text(format_stale_callback())
             return
+
+        # Runtime activation: pick up restarted ACTIVE search without restart
+        if getattr(self, "_on_search_activated", None) is not None:
+            try:
+                import inspect
+
+                res = self._on_search_activated(search_id)
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:
+                pass
 
         # Success
         await query.message.reply_text(format_restart_success())

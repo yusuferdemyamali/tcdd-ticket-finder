@@ -52,6 +52,7 @@ class MonitoringService:
         self._sleep_fn = sleep_fn
         self._consecutive_failures: dict[int, int] = {}
         self._active_tasks: dict[int, asyncio.Task] = {}
+        self._in_flight: set[int] = set()
 
     def _now_dt(self) -> datetime.datetime:
         if self._now_fn is not None:
@@ -116,7 +117,7 @@ class MonitoringService:
     async def run_once(self) -> str:
         """Deterministic one-check entry point.
 
-        Returns outcome string: "no_active", "expired", "no_match", "found", "found_notify_failed", "outage", "recovery_notified"
+        Returns outcome string: "no_active", "expired", "no_match", "found", "found_notify_failed", "outage", "recovery_notified", "inflight"
         Does not sleep. May raise on non-TCDD error or notification failure.
         Tests can call this without sleeping.
         """
@@ -124,185 +125,192 @@ class MonitoringService:
         search = self.ticket_service.get_active_search()
         if search is None:
             return "no_active"
-
-        # Expiration check before TCDD call
-        if self._is_expired(search, now):
-            # Transition to EXPIRED
-            self.ticket_service.expire_search(search.id)
-            # Send one expiration notification
-            try:
-                await _call_maybe_async(self.notifier.notify_expired, search)
-            except Exception:
-                pass
-            return "expired"
-
-        was_outage = bool(getattr(search, "tcdd_outage_notified", False))
-
-        # Query TCDD – handle typed TCDD errors as outage, not empty
+        sid = search.id
+        if sid in self._in_flight:
+            return "inflight"
+        self._in_flight.add(sid)
         try:
-            trains = self.tcdd_client.search_trains(
-                search.origin_station_id,
-                search.destination_station_id,
-                search.travel_date,
-            )
-        except Exception as e:
-            # Distinguish typed TCDD errors from other errors
-            try:
-                from app.tcdd.exceptions import TcddError, TcddAuthenticationError  # local import to avoid cycle
-            except Exception:
-                TcddError = Exception  # fallback
-                TcddAuthenticationError = type("Dummy", (Exception,), {})
+            # Expiration check before TCDD call
+            if self._is_expired(search, now):
+                # Transition to EXPIRED
+                self.ticket_service.expire_search(search.id)
+                # Send one expiration notification
+                try:
+                    await _call_maybe_async(self.notifier.notify_expired, search)
+                except Exception:
+                    pass
+                return "expired"
 
-            is_tcdd = isinstance(e, TcddError)
-            if not is_tcdd:
-                # Re-raise non-TCDD errors (programming errors, notify failures etc.)
-                raise
+            was_outage = bool(getattr(search, "tcdd_outage_notified", False))
 
-            # Typed TCDD outage: persist check + error time
+            # Query TCDD – handle typed TCDD errors as outage, not empty
             try:
-                self.ticket_service.record_tcdd_error(search.id)
+                trains = await _call_maybe_async(
+                    self.tcdd_client.search_trains,
+                    search.origin_station_id,
+                    search.destination_station_id,
+                    search.travel_date,
+                )
+            except Exception as e:
+                # Distinguish typed TCDD errors from other errors
+                try:
+                    from app.tcdd.exceptions import TcddError, TcddAuthenticationError  # local import to avoid cycle
+                except Exception:
+                    TcddError = Exception  # fallback
+                    TcddAuthenticationError = type("Dummy", (Exception,), {})
+
+                is_tcdd = isinstance(e, TcddError)
+                if not is_tcdd:
+                    # Re-raise non-TCDD errors (programming errors, notify failures etc.)
+                    raise
+
+                # Typed TCDD outage: persist check + error time
+                try:
+                    self.ticket_service.record_tcdd_error(search.id)
+                except Exception:
+                    pass
+
+                # Increment consecutive failure count for this search
+                sid2 = search.id
+                self._consecutive_failures[sid2] = self._consecutive_failures.get(sid2, 0) + 1
+                delay = self._backoff_delay(self._consecutive_failures[sid2])
+                next_at = now + datetime.timedelta(seconds=delay)
+                try:
+                    self.ticket_service.set_next_check_at(search.id, next_at.isoformat())
+                except Exception:
+                    pass
+
+                # Outage notification deduplication via persisted flag
+                # Re-fetch to see persisted state after record
+                try:
+                    fresh = self.ticket_service.get_search(search.id)
+                    already_notified = bool(getattr(fresh, "tcdd_outage_notified", False))
+                except Exception:
+                    already_notified = was_outage
+
+                if not already_notified:
+                    is_auth = False
+                    try:
+                        is_auth = isinstance(e, TcddAuthenticationError)
+                    except Exception:
+                        is_auth = False
+                    try:
+                        if is_auth and hasattr(self.notifier, "notify_auth_outage"):
+                            await _call_maybe_async(self.notifier.notify_auth_outage, search)
+                        elif hasattr(self.notifier, "notify_outage"):
+                            await _call_maybe_async(self.notifier.notify_outage, search)
+                        # Persist outage notified only after successful send
+                        try:
+                            self.ticket_service.set_tcdd_outage_notified(search.id, True)
+                        except Exception:
+                            pass
+                    except Exception:
+                        # Outage notification failure should not crash loop; keep search retryable
+                        # Do not persist notified flag if send failed
+                        pass
+
+                # Keep expiration active during outage: if already expired (edge), expire now
+                # This handles case where window passed exactly at outage time
+                if self._is_expired(search, now):
+                    # We already checked before TCDD, but if time progressed, re-check
+                    try:
+                        self.ticket_service.expire_search(search.id)
+                        try:
+                            await _call_maybe_async(self.notifier.notify_expired, search)
+                        except Exception:
+                            pass
+                        return "expired"
+                    except Exception:
+                        pass
+                return "outage"
+
+            # Success path: persist successful check
+            try:
+                self.ticket_service.record_successful_check(search.id)
             except Exception:
                 pass
 
-            # Increment consecutive failure count for this search
-            sid = search.id
-            self._consecutive_failures[sid] = self._consecutive_failures.get(sid, 0) + 1
-            delay = self._backoff_delay(self._consecutive_failures[sid])
-            next_at = now + datetime.timedelta(seconds=delay)
+            # If had outage before, send recovery once and clear flag
+            if was_outage:
+                try:
+                    if hasattr(self.notifier, "notify_recovery"):
+                        await _call_maybe_async(self.notifier.notify_recovery, search)
+                    # Clear persisted outage state after successful recovery notification
+                    try:
+                        self.ticket_service.clear_tcdd_outage(search.id)
+                    except Exception:
+                        # fallback
+                        try:
+                            self.ticket_service.set_tcdd_outage_notified(search.id, False)
+                        except Exception:
+                            pass
+                except Exception:
+                    # Recovery notification failure should not block polling; keep outage flag for retry?
+                    # Spec says outage/recovery Telegram send can fail but polling continues; keep flag?
+                    # To avoid spam, we clear only on success. So if recovery send fails, keep flag.
+                    pass
+
+            # Reset failure count on success
+            self._consecutive_failures[search.id] = 0
+
+            # For run_once alone, still schedule next check for normal polling so that
+            # startup recovery can use persisted next_check_at. However to keep
+            # run_loop test deterministic (one random per loop iteration), we only
+            # persist here if not inside run_loop's managed loop persistence.
+            # We detect if run_loop will handle persistence by checking if next_check
+            # already managed – for simplicity, keep persistence here but loop will reuse
+            # the same diff without extra random. To avoid double random in loop test,
+            # we persist with a deterministic interval that loop will reuse.
+            # We still need to persist for standalone run_once tests, so do it.
+            # But to avoid double random in loop test, we will make loop not generate
+            # extra random when next_check already set by run_once.
             try:
+                interval = self._random_interval()
+                next_at = now + datetime.timedelta(seconds=interval)
                 self.ticket_service.set_next_check_at(search.id, next_at.isoformat())
             except Exception:
                 pass
 
-            # Outage notification deduplication via persisted flag
-            # Re-fetch to see persisted state after record
+            eligible = filter_eligible_trains(search, trains)
+
+            if not eligible:
+                return "no_match"
+
+            # Found: persist found event before notification for restart recovery
             try:
-                fresh = self.ticket_service.get_search(search.id)
-                already_notified = bool(getattr(fresh, "tcdd_outage_notified", False))
+                # Use mark_found with trains to persist found_trains_json
+                self.ticket_service.mark_found(search.id, trains=eligible)
             except Exception:
-                already_notified = was_outage
-
-            if not already_notified:
-                is_auth = False
+                # Fallback if mark_found with trains not supported
                 try:
-                    is_auth = isinstance(e, TcddAuthenticationError)
-                except Exception:
-                    is_auth = False
-                try:
-                    if is_auth and hasattr(self.notifier, "notify_auth_outage"):
-                        await _call_maybe_async(self.notifier.notify_auth_outage, search)
-                    elif hasattr(self.notifier, "notify_outage"):
-                        await _call_maybe_async(self.notifier.notify_outage, search)
-                    # Persist outage notified only after successful send
-                    try:
-                        self.ticket_service.set_tcdd_outage_notified(search.id, True)
-                    except Exception:
-                        pass
-                except Exception:
-                    # Outage notification failure should not crash loop; keep search retryable
-                    # Do not persist notified flag if send failed
-                    pass
-
-            # Keep expiration active during outage: if already expired (edge), expire now
-            # This handles case where window passed exactly at outage time
-            if self._is_expired(search, now):
-                # We already checked before TCDD, but if time progressed, re-check
-                try:
-                    self.ticket_service.expire_search(search.id)
-                    try:
-                        await _call_maybe_async(self.notifier.notify_expired, search)
-                    except Exception:
-                        pass
-                    return "expired"
+                    self.ticket_service.mark_found(search.id)
+                    # Try separate persist
+                    if hasattr(self.ticket_service, "persist_found_trains"):
+                        self.ticket_service.persist_found_trains(search.id, eligible)
                 except Exception:
                     pass
-            return "outage"
-
-        # Success path: persist successful check
-        try:
-            self.ticket_service.record_successful_check(search.id)
-        except Exception:
-            pass
-
-        # If had outage before, send recovery once and clear flag
-        if was_outage:
-            try:
-                if hasattr(self.notifier, "notify_recovery"):
-                    await _call_maybe_async(self.notifier.notify_recovery, search)
-                # Clear persisted outage state after successful recovery notification
-                try:
-                    self.ticket_service.clear_tcdd_outage(search.id)
-                except Exception:
-                    # fallback
-                    try:
-                        self.ticket_service.set_tcdd_outage_notified(search.id, False)
-                    except Exception:
-                        pass
-            except Exception:
-                # Recovery notification failure should not block polling; keep outage flag for retry?
-                # Spec says outage/recovery Telegram send can fail but polling continues; keep flag?
-                # To avoid spam, we clear only on success. So if recovery send fails, keep flag.
+            else:
+                # If mark_found succeeded with trains, also ensure persist for older code paths
+                # mark_found already stored json if trains provided; ensure we don't duplicate
                 pass
 
-        # Reset failure count on success
-        self._consecutive_failures[search.id] = 0
-
-        # For run_once alone, still schedule next check for normal polling so that
-        # startup recovery can use persisted next_check_at. However to keep
-        # run_loop test deterministic (one random per loop iteration), we only
-        # persist here if not inside run_loop's managed loop persistence.
-        # We detect if run_loop will handle persistence by checking if next_check
-        # already managed – for simplicity, keep persistence here but loop will reuse
-        # the same diff without extra random. To avoid double random in loop test,
-        # we persist with a deterministic interval that loop will reuse.
-        # We still need to persist for standalone run_once tests, so do it.
-        # But to avoid double random in loop test, we will make loop not generate
-        # extra random when next_check already set by run_once.
-        try:
-            interval = self._random_interval()
-            next_at = now + datetime.timedelta(seconds=interval)
-            self.ticket_service.set_next_check_at(search.id, next_at.isoformat())
-        except Exception:
-            pass
-
-        eligible = filter_eligible_trains(search, trains)
-
-        if not eligible:
-            return "no_match"
-
-        # Found: persist found event before notification for restart recovery
-        try:
-            # Use mark_found with trains to persist found_trains_json
-            self.ticket_service.mark_found(search.id, trains=eligible)
-        except Exception:
-            # Fallback if mark_found with trains not supported
+            # Notify – if fails, leave as FOUND and do NOT mark COMPLETED
             try:
-                self.ticket_service.mark_found(search.id)
-                # Try separate persist
-                if hasattr(self.ticket_service, "persist_found_trains"):
-                    self.ticket_service.persist_found_trains(search.id, eligible)
+                await _call_maybe_async(self.notifier.notify_found, search, eligible)
+            except Exception:
+                # Leave FOUND, propagate exception to caller for test visibility
+                raise
+
+            # Only after successful notification, mark COMPLETED
+            try:
+                self.ticket_service.mark_completed(search.id)
             except Exception:
                 pass
-        else:
-            # If mark_found succeeded with trains, also ensure persist for older code paths
-            # mark_found already stored json if trains provided; ensure we don't duplicate
-            pass
+            return "found"
+        finally:
+            self._in_flight.discard(sid)
 
-        # Notify – if fails, leave as FOUND and do NOT mark COMPLETED
-        try:
-            await _call_maybe_async(self.notifier.notify_found, search, eligible)
-        except Exception:
-            # Leave FOUND, propagate exception to caller for test visibility
-            raise
-
-        # Only after successful notification, mark COMPLETED
-        try:
-            self.ticket_service.mark_completed(search.id)
-        except Exception:
-            pass
-        return "found"
-
-    # Alias for spec wording: "deterministic one-check monitoring entry point"
+    # Alias for spec wording    # Alias for spec wording: "deterministic one-check monitoring entry point"
     async def check_once(self) -> str:
         return await self.run_once()
 
@@ -511,6 +519,58 @@ class MonitoringService:
                 except Exception as e:
                     result["errors"].append(str(e))
         return result
+
+    async def activate_search(self, search_id: int | None = None) -> bool:
+        """Idempotent runtime pickup for persisted ACTIVE searches.
+
+        Starts monitoring for the given ACTIVE search without requiring restart.
+        Shares duplicate-task protection with `startup_recovery`.
+        If `search_id` is None, picks up the current ACTIVE search.
+        Returns True if monitoring was started or already active, False otherwise.
+        Non-active statuses do not create tasks or TCDD calls.
+        """
+        target_id: int | None = search_id
+        target = None
+        try:
+            if target_id is None:
+                target = self.ticket_service.get_active_search()
+                if target is None:
+                    return False
+                target_id = target.id
+            else:
+                target = self.ticket_service.get_search(int(target_id))
+        except Exception:
+            return False
+
+        if target is None:
+            return False
+        # Only ACTIVE searches are eligible; verify persisted status
+        try:
+            status_val = target.status.value if hasattr(target.status, "value") else str(target.status)
+        except Exception:
+            status_val = str(getattr(target, "status", ""))
+        if status_val != "ACTIVE":
+            return False
+
+        # Idempotent duplicate protection – same registry as startup_recovery
+        if target_id in self._active_tasks:
+            t = self._active_tasks[target_id]
+            if not t.done():
+                return True
+            else:
+                # clean stale done entry
+                self._active_tasks.pop(target_id, None)
+
+        try:
+            task = asyncio.create_task(self._run_active_loop(int(target_id)))
+            self._active_tasks[int(target_id)] = task
+            return True
+        except Exception:
+            return False
+
+    # Alias for alternative naming used in design discussions
+    async def pickup_search(self, search_id: int | None = None) -> bool:
+        return await self.activate_search(search_id)
 
     async def _run_active_loop(self, search_id: int) -> None:
         """Background loop for one ACTIVE search, respecting next_check_at and expiration.

@@ -81,11 +81,12 @@ class TelegramHandlers:
     now_fn: callable returning datetime for date validation (optional)
     """
 
-    def __init__(self, ticket_service, station_provider, allowed_user_id: int, now_fn=None) -> None:
+    def __init__(self, ticket_service, station_provider, allowed_user_id: int, now_fn=None, on_search_activated=None) -> None:
         self.ticket_service = ticket_service
         self.station_provider = station_provider
         self.allowed_user_id = allowed_user_id
         self.now_fn = now_fn
+        self._on_search_activated = on_search_activated
 
     # ---------- helpers ----------
     def _check_auth(self, update: Update) -> bool:
@@ -508,6 +509,16 @@ class TelegramHandlers:
             context.user_data.pop("wizard", None)
             context.user_data.pop("station_candidates", None)
             context.user_data.pop("station_step", None)
+            # Runtime activation: pick up new ACTIVE search without restart
+            if getattr(self, "_on_search_activated", None) is not None:
+                try:
+                    import inspect
+
+                    res = self._on_search_activated(result.id)
+                    if inspect.isawaitable(res):
+                        await res
+                except Exception:
+                    pass
             await query.message.reply_text(msg)
             try:
                 await query.edit_message_text("✅ İşlem tamamlandı.")

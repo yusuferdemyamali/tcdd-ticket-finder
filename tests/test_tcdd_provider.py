@@ -266,10 +266,14 @@ def test_parse_real_fixture():
     ids = {r.train_id for r in result}
     assert 191591 in ids
     assert 191804 in ids
-    # economy for those
+    # economy for those – must match cabin availabilityCount, not bookingClassCapacities.capacity
     m = {r.train_id: r for r in result}
-    assert m[191591].economy_available == 708
-    assert m[191804].economy_available == 778
+    assert m[191591].economy_available == 286, "fixture 191591 cabin economy availabilityCount is 286, not capacity 708"
+    assert m[191804].economy_available == 77, "fixture 191804 cabin economy availabilityCount is 77, not capacity 778"
+    # Additional spot checks to ensure capacity values are not leaked
+    assert m[191590].economy_available == 240
+    assert m[191592].economy_available == 39
+    assert m[191561].economy_available == 31
 
 
 # --- 3.2 date filtering ---
@@ -317,28 +321,59 @@ def test_economy_category_extraction():
     epoch = 1789007400000
     arr = 1789007940000
 
-    def make(id_, caps):
-        return {
+    def make(id_, cabin_count, caps=None):
+        train = {
             "id": id_,
             "name": "T",
             "number": str(id_),
             "segments": [{"departureTime": epoch, "arrivalTime": arr}],
-            "bookingClassCapacities": caps,
+            "availableFareInfo": [
+                {"cabinClasses": [{"cabinClass": {"id": 2, "name": "EKONOMİ"}, "availabilityCount": cabin_count}]}
+            ],
         }
+        if caps is not None:
+            train["bookingClassCapacities"] = caps
+        else:
+            # include capacity field to verify it is not used (capacity 999 should not affect result)
+            train["bookingClassCapacities"] = [{"bookingClassId": 1, "capacity": 999}]
+        return train
 
-    # economy 0 preserved
-    raw0 = {"trainLegs": [{"trainAvailabilities": [{"trains": [make(1, [{"bookingClassId": 1, "capacity": 0}])]}]}]}
+    # economy 0 preserved (availabilityCount ==0, capacity 999 ignored)
+    raw0 = {"trainLegs": [{"trainAvailabilities": [{"trains": [make(1, 0)]}]}]}
     res0 = parse_train_availability(raw0, "2026-09-10")
     assert res0[0].economy_available == 0
 
-    # economy >=1 preserved
-    raw1 = {"trainLegs": [{"trainAvailabilities": [{"trains": [make(2, [{"bookingClassId": 1, "capacity": 5}])]}]}]}
+    # economy >=1 preserved via cabin availabilityCount, not capacity
+    raw1 = {"trainLegs": [{"trainAvailabilities": [{"trains": [make(2, 5)]}]}]}
     res1 = parse_train_availability(raw1, "2026-09-10")
     assert res1[0].economy_available == 5
 
-    raw2 = {"trainLegs": [{"trainAvailabilities": [{"trains": [make(3, [{"bookingClassId": 1, "capacity": 1}])]}]}]}
+    raw2 = {"trainLegs": [{"trainAvailabilities": [{"trains": [make(3, 1)]}]}]}
     res2 = parse_train_availability(raw2, "2026-09-10")
     assert res2[0].economy_available == 1
+
+    # capacity-only without fare info must yield 0
+    raw_cap_only = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 99,
+                                "name": "T",
+                                "number": "99",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "bookingClassCapacities": [{"bookingClassId": 1, "capacity": 708}],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    res_cap = parse_train_availability(raw_cap_only, "2026-09-10")
+    assert res_cap[0].economy_available == 0
 
 
 # --- 3.4 separate categories ---
@@ -346,29 +381,440 @@ def test_business_accessible_special_separate():
     epoch = 1789007400000
     arr = 1789007940000
 
-    def make(caps):
-        return {
+    def make_train(cabin_entries, caps=None):
+        train = {
             "id": 99,
             "name": "T",
             "number": "99",
             "segments": [{"departureTime": epoch, "arrivalTime": arr}],
-            "bookingClassCapacities": caps,
+            "availableFareInfo": [
+                {"cabinClasses": [{"cabinClass": {"id": e["id"], "name": e["name"]}, "availabilityCount": e["availabilityCount"]} for e in cabin_entries]}
+            ],
         }
+        if caps is not None:
+            train["bookingClassCapacities"] = caps
+        return train
 
-    cases = [
-        ([{"bookingClassId": 4, "capacity": 10}, {"bookingClassId": 1, "capacity": 0}], 0),
-        ([{"bookingClassId": 23, "capacity": 4}, {"bookingClassId": 1, "capacity": 0}], 0),
-        ([{"bookingClassId": 22, "capacity": 12}, {"bookingClassId": 1, "capacity": 0}], 0),
-        ([{"bookingClassId": 4, "capacity": 55}, {"bookingClassId": 22, "capacity": 12}], 0),
-    ]
-    for caps, expected in cases:
-        raw = {"trainLegs": [{"trainAvailabilities": [{"trains": [make(caps)]}]}]}
-        res = parse_train_availability(raw, "2026-09-10")
-        assert res[0].economy_available == expected, f"caps {caps} should give {expected}"
+    # Business-only (cabin id 1) with no economy should yield 0
+    raw = {"trainLegs": [{"trainAvailabilities": [{"trains": [make_train([{"id": 1, "name": "BUSİNESS", "availabilityCount": 10}])]}]}]}
+    assert parse_train_availability(raw, "2026-09-10")[0].economy_available == 0
 
-    # economy with business still 5
-    raw = {"trainLegs": [{"trainAvailabilities": [{"trains": [make([{"bookingClassId": 4, "capacity": 10}, {"bookingClassId": 1, "capacity": 5}])]}]}]}
-    assert parse_train_availability(raw, "2026-09-10")[0].economy_available == 5
+    # Accessible-only (cabin id 12) with no economy should yield 0
+    raw2 = {"trainLegs": [{"trainAvailabilities": [{"trains": [make_train([{"id": 12, "name": "TEKERLEKLİ SANDALYE", "availabilityCount": 4}])]}]}]}
+    assert parse_train_availability(raw2, "2026-09-10")[0].economy_available == 0
+
+    # Special-seat-only (LOCA id 11) with no economy should yield 0
+    raw3 = {"trainLegs": [{"trainAvailabilities": [{"trains": [make_train([{"id": 11, "name": "LOCA", "availabilityCount": 12}])]}]}]}
+    assert parse_train_availability(raw3, "2026-09-10")[0].economy_available == 0
+
+    # Business + special, no economy -> 0 even though capacities would be high
+    raw4 = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            make_train(
+                                [
+                                    {"id": 1, "name": "BUSİNESS", "availabilityCount": 55},
+                                    {"id": 11, "name": "LOCA", "availabilityCount": 12},
+                                ],
+                                caps=[{"bookingClassId": 1, "capacity": 999}],
+                            )
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw4, "2026-09-10")[0].economy_available == 0
+
+    # Business + economy: economy count isolated
+    raw5 = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            make_train(
+                                [
+                                    {"id": 1, "name": "BUSİNESS", "availabilityCount": 10},
+                                    {"id": 2, "name": "EKONOMİ", "availabilityCount": 5},
+                                ]
+                            )
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw5, "2026-09-10")[0].economy_available == 5
+
+    # Accessible + economy: still returns economy only
+    raw6 = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            make_train(
+                                [
+                                    {"id": 12, "name": "TEKERLEKLİ SANDALYE", "availabilityCount": 4},
+                                    {"id": 2, "name": "EKONOMİ", "availabilityCount": 3},
+                                ]
+                            )
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw6, "2026-09-10")[0].economy_available == 3
+
+
+def test_economy_zero_and_positive_via_cabin():
+    epoch = 1789007400000
+    arr = 1789007940000
+
+    # economy ==0 via cabin
+    raw_zero = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 1001,
+                                "name": "T",
+                                "number": "1001",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "availableFareInfo": [
+                                    {"cabinClasses": [{"cabinClass": {"id": 2, "name": "EKONOMİ"}, "availabilityCount": 0}]}
+                                ],
+                                "bookingClassCapacities": [{"bookingClassId": 1, "capacity": 999}],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw_zero, "2026-09-10")[0].economy_available == 0
+
+    # economy >0 via cabin
+    raw_pos = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 1002,
+                                "name": "T",
+                                "number": "1002",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "availableFareInfo": [
+                                    {"cabinClasses": [{"cabinClass": {"id": 2, "name": "EKONOMİ"}, "availabilityCount": 286}]}
+                                ],
+                                "bookingClassCapacities": [{"bookingClassId": 1, "capacity": 999}],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw_pos, "2026-09-10")[0].economy_available == 286
+
+
+def test_business_only_and_accessible_only_via_cabin():
+    epoch = 1789007400000
+    arr = 1789007940000
+    # business-only (id 1)
+    raw_bus = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 2001,
+                                "name": "T",
+                                "number": "2001",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "availableFareInfo": [
+                                    {"cabinClasses": [{"cabinClass": {"id": 1, "name": "BUSİNESS"}, "availabilityCount": 38}]}
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw_bus, "2026-09-10")[0].economy_available == 0
+
+    # accessible-only (id 12)
+    raw_acc = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 2002,
+                                "name": "T",
+                                "number": "2002",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "availableFareInfo": [
+                                    {"cabinClasses": [{"cabinClass": {"id": 12, "name": "TEKERLEKLİ SANDALYE"}, "availabilityCount": 2}]}
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw_acc, "2026-09-10")[0].economy_available == 0
+
+    # business + accessible, no economy -> still 0, even with high capacity
+    raw_both = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 2003,
+                                "name": "T",
+                                "number": "2003",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "availableFareInfo": [
+                                    {
+                                        "cabinClasses": [
+                                            {"cabinClass": {"id": 1, "name": "BUSİNESS"}, "availabilityCount": 20},
+                                            {"cabinClass": {"id": 12, "name": "TEKERLEKLİ SANDALYE"}, "availabilityCount": 2},
+                                        ]
+                                    }
+                                ],
+                                "bookingClassCapacities": [{"bookingClassId": 1, "capacity": 708}],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw_both, "2026-09-10")[0].economy_available == 0
+
+
+def test_duplicate_fare_family_economy_not_inflated():
+    epoch = 1789007400000
+    arr = 1789007940000
+    # duplicate same count -> not summed
+    raw_dup = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 3001,
+                                "name": "T",
+                                "number": "3001",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "availableFareInfo": [
+                                    {"fareFamily": {"id": 1, "name": "STANDART"}, "cabinClasses": [{"cabinClass": {"id": 2, "name": "EKONOMİ"}, "availabilityCount": 5}]},
+                                    {"fareFamily": {"id": 2, "name": "PROMO"}, "cabinClasses": [{"cabinClass": {"id": 2, "name": "EKONOMİ"}, "availabilityCount": 5}]},
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw_dup, "2026-09-10")[0].economy_available == 5
+
+    # duplicate different counts -> max, not sum
+    raw_dup2 = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 3002,
+                                "name": "T",
+                                "number": "3002",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "availableFareInfo": [
+                                    {"fareFamily": {"id": 1}, "cabinClasses": [{"cabinClass": {"id": 2, "name": "EKONOMİ"}, "availabilityCount": 3}]},
+                                    {"fareFamily": {"id": 2}, "cabinClasses": [{"cabinClass": {"id": 2, "name": "EKONOMİ"}, "availabilityCount": 7}]},
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw_dup2, "2026-09-10")[0].economy_available == 7
+
+
+def test_economy_name_fallback_normalized():
+    epoch = 1789007400000
+    arr = 1789007940000
+    # id missing, name EKONOMİ dotted -> should be treated as economy
+    raw = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 5001,
+                                "name": "T",
+                                "number": "5001",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "availableFareInfo": [
+                                    {"cabinClasses": [{"cabinClass": {"name": "EKONOMİ"}, "availabilityCount": 12}]}
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw, "2026-09-10")[0].economy_available == 12
+    # ascii variant
+    raw2 = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 5002,
+                                "name": "T",
+                                "number": "5002",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "availableFareInfo": [
+                                    {"cabinClasses": [{"cabinClass": {"name": "EKONOMI"}, "availabilityCount": 9}]}
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw2, "2026-09-10")[0].economy_available == 9
+    # lower case with spaces
+    raw3 = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 5003,
+                                "name": "T",
+                                "number": "5003",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "availableFareInfo": [
+                                    {"cabinClasses": [{"cabinClass": {"name": " ekonomi "}, "availabilityCount": 4}]}
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw3, "2026-09-10")[0].economy_available == 4
+
+
+def test_capacity_fields_never_used_for_availability():
+    epoch = 1789007400000
+    arr = 1789007940000
+    raw = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 4001,
+                                "name": "T",
+                                "number": "4001",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "bookingClassCapacities": [
+                                    {"bookingClassId": 1, "capacity": 708},
+                                    {"bookingClassId": 4, "capacity": 110},
+                                ],
+                                "availableFareInfo": [
+                                    {"cabinClasses": [{"cabinClass": {"id": 2, "name": "EKONOMİ"}, "availabilityCount": 0}]}
+                                ],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    # capacity 708 ignored, cabin 0 wins
+    assert parse_train_availability(raw, "2026-09-10")[0].economy_available == 0
+    # also verify capacity-only without cabin yields 0
+    raw2 = {
+        "trainLegs": [
+            {
+                "trainAvailabilities": [
+                    {
+                        "trains": [
+                            {
+                                "id": 4002,
+                                "name": "T",
+                                "number": "4002",
+                                "segments": [{"departureTime": epoch, "arrivalTime": arr}],
+                                "bookingClassCapacities": [{"bookingClassId": 1, "capacity": 424}],
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    assert parse_train_availability(raw2, "2026-09-10")[0].economy_available == 0
+
+
+def test_provider_boundary_no_raw_fields():
+    fixture_path = pathlib.Path("tests/fixtures/tcdd_real_response.json")
+    raw = json.loads(fixture_path.read_text())
+    result = parse_train_availability(raw, "2026-09-10")
+    for r in result:
+        # TrainAvailability must not expose raw TCDD fields
+        assert not hasattr(r, "raw")
+        assert not hasattr(r, "bookingClassCapacities")
+        assert not hasattr(r, "availableFareInfo")
+        assert not hasattr(r, "cabinClasses")
+        assert not hasattr(r, "cabinClass")
+        # check via __dict__ / slots that no extra attributes leaked
+        for bad in ("bookingClassCapacities", "availableFareInfo", "cabinClasses", "raw", "cabinClassAvailabilities"):
+            assert bad not in r.__dict__ if hasattr(r, "__dict__") else True
+            assert not hasattr(r, bad)
+        # ensure only normalized fields exist
+        assert hasattr(r, "economy_available")
+        assert hasattr(r, "train_id")
+        assert hasattr(r, "departure_at")
+    # monitoring layer should consume only normalized records – verify import isolation
+    import pathlib as _pl
+
+    assert "bookingClassCapacities" not in _pl.Path("app/monitoring/filtering.py").read_text()
+    assert "availableFareInfo" not in _pl.Path("app/monitoring/filtering.py").read_text()
+    assert "TrainAvailability" in _pl.Path("app/monitoring/filtering.py").read_text()
 
 
 # --- 3.5 invalid shape raises ---

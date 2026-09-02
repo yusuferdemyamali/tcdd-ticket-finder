@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import datetime
+import re
+import unicodedata
 from typing import Any
 
 from .exceptions import TcddUnexpectedResponseError
 from .models import TrainAvailability
 
 # Booking class mapping – validated via /datas/booking-classes.json
+# Kept for reference; not used for availability (availability uses cabin semantics)
 ECONOMY_BC_ID = 1
 BUSINESS_BC_ID = 4
 ACCESSIBLE_BC_ID = 23
 SPECIAL_BC_IDS = {22, 7, 8, 24, 26}
+
+# Cabin class mapping – verified via real TCDD fixture (availableFareInfo[].cabinClasses[].cabinClass)
+ECONOMY_CABIN_ID = 2
+BUSINESS_CABIN_ID = 1
+ACCESSIBLE_CABIN_ID = 12
 
 
 def _epoch_ms_to_local(ms: int, tz_name: str = "Europe/Istanbul") -> datetime.datetime:
@@ -44,7 +52,35 @@ def _parse_travel_date_norm(travel_date: str | datetime.date | datetime.datetime
     raise TcddUnexpectedResponseError(f"invalid travel_date format {travel_date!r}")
 
 
+def _normalize_cabin_name(name: str) -> str:
+    """Normalize cabin name for economy fallback (handles EKONOMİ/EKONOMI variants)."""
+    s = name.strip().lower()
+    s = s.replace("ı", "i").replace("ş", "s").replace("ğ", "g").replace("ü", "u").replace("ö", "o").replace("ç", "c").replace("İ", "i")
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+
+def _is_economy_cabin(cabin_class: Any) -> bool:
+    if not isinstance(cabin_class, dict):
+        return False
+    cid = cabin_class.get("id")
+    try:
+        if cid is not None and int(cid) == ECONOMY_CABIN_ID:
+            return True
+    except Exception:
+        pass
+    name = cabin_class.get("name")
+    if isinstance(name, str) and _normalize_cabin_name(name) == "ekonomi":
+        return True
+    return False
+
+
 def _extract_economy(booking_caps: Any) -> int:
+    """Legacy capacity-based helper kept for reference but not used for availability.
+
+    Do NOT use for economy_available; preserved only to avoid breaking external callers.
+    """
     if not isinstance(booking_caps, list):
         return 0
     cap_by_id: dict[int, int] = {}
@@ -61,6 +97,51 @@ def _extract_economy(booking_caps: Any) -> int:
         if bc_id_int is not None:
             cap_by_id[bc_id_int] = cap_int
     return int(cap_by_id.get(ECONOMY_BC_ID, 0))
+
+
+def _extract_economy_from_fare_info(train: Any) -> int:
+    """Extract normal economy availability from availableFareInfo[].cabinClasses[].availabilityCount.
+
+    - Identifies economy cabin via cabinClass.id == 2 with normalized name fallback.
+    - Ignores business (1), accessible (12), LOCA (11), etc. unless they match economy identity.
+    - Does not use bookingClassCapacities.capacity.
+    - When duplicate economy entries appear across fare families, returns max() to avoid inflation.
+    """
+    if not isinstance(train, dict):
+        return 0
+    afis = train.get("availableFareInfo")
+    if not isinstance(afis, list):
+        return 0
+    counts: list[int] = []
+    for afi in afis:
+        if not isinstance(afi, dict):
+            continue
+        cabin_classes = afi.get("cabinClasses")
+        if not isinstance(cabin_classes, list):
+            continue
+        for entry in cabin_classes:
+            if not isinstance(entry, dict):
+                continue
+            cabin_class = entry.get("cabinClass")
+            is_economy = False
+            if isinstance(cabin_class, dict):
+                is_economy = _is_economy_cabin(cabin_class)
+            elif "id" in entry or "name" in entry:
+                # Fallback where entry itself looks like cabinClass
+                is_economy = _is_economy_cabin(entry)
+            if not is_economy:
+                continue
+            avail = entry.get("availabilityCount")
+            try:
+                cnt = int(avail) if avail is not None else 0
+                if cnt < 0:
+                    cnt = 0
+                counts.append(cnt)
+            except Exception:
+                counts.append(0)
+    if not counts:
+        return 0
+    return max(counts)
 
 
 def parse_train_availability(raw: Any, travel_date: str | datetime.date | datetime.datetime) -> list[TrainAvailability]:
@@ -126,11 +207,8 @@ def parse_train_availability(raw: Any, travel_date: str | datetime.date | dateti
                     # name and number - fallbacks
                     train_name = str(train.get("name", "") or train.get("commercialName", ""))
                     train_number = str(train.get("number", ""))
-                    # booking capacities
-                    booking_caps = train.get("bookingClassCapacities")
-                    # If bookingClassCapacities is missing, we treat as 0 economy but still produce record?
-                    # Require usable capacities; if None, treat as 0
-                    economy = _extract_economy(booking_caps) if booking_caps is not None else 0
+                    # Normal economy availability from cabinClasses availabilityCount (not capacity)
+                    economy = _extract_economy_from_fare_info(train)
 
                     # Ensure we produce valid record; train_id must be present? If missing, skip
                     # Keep train_id as int or str
