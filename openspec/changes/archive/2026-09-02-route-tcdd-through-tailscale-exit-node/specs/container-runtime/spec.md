@@ -1,0 +1,52 @@
+## ADDED Requirements
+
+### Requirement: Compose routes TCDD traffic through a Tailscale sidecar
+The Compose runtime SHALL include a `tailscale` sidecar service that provides an outbound HTTP proxy for TCDD traffic from the application container.
+
+The sidecar SHALL use the official `tailscale/tailscale` image, userspace networking, a container-network HTTP proxy listener, runtime-provided Tailscale authentication, a runtime-provided exit node, and persistent state storage. The runtime SHALL NOT require host networking, privileged mode, or `/dev/net/tun` for this sidecar.
+
+#### Scenario: Sidecar starts with runtime-only Tailscale configuration
+- **WHEN** the Compose stack is started with `TAILSCALE_AUTHKEY` and `TAILSCALE_EXIT_NODE` supplied at runtime
+- **THEN** the `tailscale` service joins the tailnet using those runtime values
+- **AND** the auth key and exit node are not hardcoded in `docker-compose.yml`, committed environment examples, or image build instructions
+
+#### Scenario: Sidecar exposes an internal HTTP proxy
+- **WHEN** the Compose stack is running
+- **THEN** the application container can reach an HTTP outbound proxy at `http://tailscale:1055` on the Compose network
+- **AND** the proxy can fetch general HTTPS URLs through the selected Tailscale exit node
+
+#### Scenario: App config points TCDD traffic at the sidecar
+- **WHEN** the app service is created by Compose
+- **THEN** `TCDD_PROXY_URL` can be set to `http://tailscale:1055` through runtime environment configuration
+- **AND** the app container remains on the same Compose network as the `tailscale` sidecar
+
+#### Scenario: Telegram traffic is not routed through the sidecar
+- **WHEN** the Compose stack runs with `TCDD_PROXY_URL=http://tailscale:1055`
+- **THEN** the runtime does not configure a global container proxy for all application traffic
+- **AND** Telegram API traffic continues to use direct outbound internet access
+
+#### Scenario: Tailscale state survives sidecar recreation
+- **WHEN** the `tailscale` service is restarted or recreated while its persistent volume remains
+- **THEN** Tailscale state remains available under the configured state directory
+- **AND** the sidecar can re-authenticate or resume tailnet membership without baking credentials into the image
+
+## MODIFIED Requirements
+
+### Requirement: Example environment documents required configuration
+The repository SHALL include an example environment file that documents the runtime environment variables required to run the Compose service and the TCDD-only Tailscale proxy path, using placeholders only.
+
+#### Scenario: Example environment contains placeholders only
+- **WHEN** `.env.example` is inspected
+- **THEN** it lists the required runtime variables for Telegram, TCDD, SQLite database path, monitoring configuration, Tailscale authentication, Tailscale exit-node selection, and TCDD proxy URL configuration
+- **AND** it includes placeholders for `TAILSCALE_AUTHKEY`, `TAILSCALE_EXIT_NODE`, and `TCDD_PROXY_URL=http://tailscale:1055`
+- **AND** it does not contain real Telegram bot tokens, Telegram user ids, TCDD tokens, Tailscale auth keys, exit node identifiers, or other secret values
+
+### Requirement: Container scope remains limited to MVP runtime
+The containerization change SHALL NOT introduce deployment platforms, ingress components, dashboards, backup automation, or new ticket-search application behavior.
+
+The only proxy component allowed by this runtime is the Tailscale sidecar outbound HTTP proxy used for TCDD endpoint access. The runtime SHALL NOT proxy all container traffic or add public proxy, rotating proxy, reverse-proxy ingress, Kubernetes, CI/CD, monitoring dashboard, backup, or web-panel behavior.
+
+#### Scenario: Out-of-scope deployment features are absent
+- **WHEN** the containerization artifacts are reviewed
+- **THEN** they do not add CI/CD pipeline configuration, Kubernetes manifests, reverse-proxy ingress configuration, public proxy fallback, rotating proxy configuration, cloud deployment configuration, monitoring dashboards, automated backup systems, or web panel behavior
+- **AND** any proxy configuration is limited to the TCDD-only Tailscale sidecar path

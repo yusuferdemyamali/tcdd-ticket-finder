@@ -10,11 +10,29 @@ services:
       POLL_MIN_SECONDS: ${POLL_MIN_SECONDS:-60}
       POLL_MAX_SECONDS: ${POLL_MAX_SECONDS:-90}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TCDD_PROXY_URL: ${TCDD_PROXY_URL:-http://tailscale:1055}
     volumes:
       - tcdd-data:/data
     restart: unless-stopped
-    # Optional: keep container alive and auto-restart on failure; uses same startup as `python -m app.main` from Dockerfile CMD
-    # No ports, no additional services; single application service per MVP.
+    depends_on:
+      - tailscale
+    # TCDD traffic is routed via Tailscale sidecar HTTP proxy at tailscale:1055.
+    # Telegram and other traffic remain direct (no HTTP_PROXY/HTTPS_PROXY set).
+    # No ports, privileged mode, host network, or /dev/net/tun.
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tcdd-tailscale
+    environment:
+      TS_AUTHKEY: ${TAILSCALE_AUTHKEY}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"
+      TS_OUTBOUND_HTTP_PROXY_LISTEN: :1055
+      TS_EXTRA_ARGS: --exit-node=${TAILSCALE_EXIT_NODE}
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    restart: unless-stopped
 
 volumes:
   tcdd-data:
+  tailscale-state:

@@ -86,6 +86,19 @@ def _format_api_date(travel_date: str | datetime.date | datetime.datetime) -> st
     return dt.strftime("%d-%m-%Y 00:00:00")
 
 
+def _resolve_tcdd_proxy_url(explicit_proxy_url: str | None) -> str | None:
+    """Resolve effective TCDD proxy URL.
+
+    Explicit value takes precedence when provided (including empty meaning disabled).
+    Otherwise reads runtime env TCDD_PROXY_URL. Returns None when unset/blank.
+    """
+    if explicit_proxy_url is not None:
+        v = explicit_proxy_url.strip()
+        return v if v else None
+    env = os.environ.get("TCDD_PROXY_URL", "").strip()
+    return env if env else None
+
+
 class TcddClient:
     """Production TCDD client – uses httpx, optional curl_cffi fallback for TLS/WAF."""
 
@@ -97,6 +110,7 @@ class TcddClient:
         train_url: str = TRAIN_AVAIL_URL_PRIMARY,
         httpx_client: httpx.Client | None = None,
         httpx_transport: httpx.BaseTransport | None = None,
+        proxy_url: str | None = None,
     ) -> None:
         self._station_url = station_url
         self._train_url = train_url
@@ -104,12 +118,42 @@ class TcddClient:
         self._stations_cache: list[Station] | None = None
         self._provided_httpx_client = httpx_client
         self._httpx_transport = httpx_transport
+        self._explicit_proxy_url = proxy_url
+
+    def _effective_proxy_url(self) -> str | None:
+        return _resolve_tcdd_proxy_url(self._explicit_proxy_url)
+
+    def _proxy_for_httpx(self) -> str | None:
+        proxy = self._effective_proxy_url()
+        if not proxy:
+            return None
+        # MockTransport is used in tests to avoid real network; proxy would bypass mock and fail DNS.
+        # Keep existing typed-error semantics for tests by not injecting proxy when mock transport is active.
+        if self._httpx_transport is not None and isinstance(self._httpx_transport, httpx.MockTransport):
+            return None
+        if self._provided_httpx_client is not None:
+            try:
+                transport = getattr(self._provided_httpx_client, "_transport", None) or getattr(
+                    self._provided_httpx_client, "transport", None
+                )
+                if isinstance(transport, httpx.MockTransport):
+                    return None
+            except Exception:
+                pass
+            # Provided client already manages its own proxy/transport; don't override.
+            return None
+        return proxy
 
     def _make_httpx_client(self) -> httpx.Client:
         if self._provided_httpx_client is not None:
             return self._provided_httpx_client
+        proxy = self._proxy_for_httpx()
         if self._httpx_transport is not None:
+            if proxy:
+                return httpx.Client(transport=self._httpx_transport, timeout=self._timeout, proxy=proxy)
             return httpx.Client(transport=self._httpx_transport, timeout=self._timeout)
+        if proxy:
+            return httpx.Client(timeout=self._timeout, proxy=proxy)
         return httpx.Client(timeout=self._timeout)
 
     def _get_token(self) -> str:
@@ -126,12 +170,21 @@ class TcddClient:
                     self._station_url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"}
                 )
                 return self._handle_station_response(resp)
-            # Use transport if provided, else default client
+            # Use transport if provided, else default client. Proxy is scoped to TCDD only.
+            proxy = self._proxy_for_httpx()
             if self._httpx_transport is not None:
+                if proxy:
+                    with httpx.Client(transport=self._httpx_transport, timeout=self._timeout, proxy=proxy) as c:
+                        resp = c.get(self._station_url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+                        return self._handle_station_response(resp)
                 with httpx.Client(transport=self._httpx_transport, timeout=self._timeout) as c:
                     resp = c.get(self._station_url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
                     return self._handle_station_response(resp)
             else:
+                if proxy:
+                    with httpx.Client(timeout=self._timeout, proxy=proxy) as c:
+                        resp = c.get(self._station_url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
+                        return self._handle_station_response(resp)
                 with httpx.Client(timeout=self._timeout) as c:
                     resp = c.get(self._station_url, headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"})
                     return self._handle_station_response(resp)
@@ -275,12 +328,23 @@ class TcddClient:
                 resp = self._provided_httpx_client.post(self._train_url, json=payload, headers=headers)
                 data = self._handle_train_response(resp)
                 return data, resp
+            proxy = self._proxy_for_httpx()
             if self._httpx_transport is not None:
+                if proxy:
+                    with httpx.Client(transport=self._httpx_transport, timeout=self._timeout, proxy=proxy) as c:
+                        resp = c.post(self._train_url, json=payload, headers=headers)
+                        data = self._handle_train_response(resp)
+                        return data, resp
                 with httpx.Client(transport=self._httpx_transport, timeout=self._timeout) as c:
                     resp = c.post(self._train_url, json=payload, headers=headers)
                     data = self._handle_train_response(resp)
                     return data, resp
             else:
+                if proxy:
+                    with httpx.Client(timeout=self._timeout, proxy=proxy) as c:
+                        resp = c.post(self._train_url, json=payload, headers=headers)
+                        data = self._handle_train_response(resp)
+                        return data, resp
                 with httpx.Client(timeout=self._timeout) as c:
                     resp = c.post(self._train_url, json=payload, headers=headers)
                     data = self._handle_train_response(resp)
