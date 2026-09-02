@@ -84,6 +84,36 @@ def build_application_with_monitoring(
             object.__setattr__(app, "monitoring_service", monitoring)  # type: ignore
         except Exception:
             pass
+
+    # Explicit lifecycle hooks: startup recovery resumes ACTIVE polling and FOUND retry
+    # without auto-starting during plain handler construction (tests remain isolated).
+    async def _monitoring_post_init(application):
+        try:
+            await monitoring.startup_recovery()
+        except Exception:
+            pass
+
+    async def _monitoring_post_shutdown(application):
+        try:
+            await monitoring.shutdown()
+        except Exception:
+            pass
+
+    # Register hooks using PTB post_init/post_shutdown if supported; keep explicit attribute for tests
+    try:
+        # PTB Application supports assignment post-build
+        app.post_init = _monitoring_post_init  # type: ignore
+        app.post_shutdown = _monitoring_post_shutdown  # type: ignore
+    except Exception:
+        pass
+
+    # Also store explicit startup hook for direct invocation in tests
+    try:
+        app.bot_data["monitoring_post_init"] = _monitoring_post_init  # type: ignore
+        app.bot_data["monitoring_post_shutdown"] = _monitoring_post_shutdown  # type: ignore
+    except Exception:
+        pass
+
     return app, monitoring
 
 

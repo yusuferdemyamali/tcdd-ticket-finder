@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS ticket_searches (
     next_check_at TEXT,
     tcdd_outage_notified INTEGER NOT NULL DEFAULT 0 CHECK (tcdd_outage_notified IN (0,1)),
     last_tcdd_error_at TEXT,
+    found_trains_json TEXT,
     found_at TEXT,
     completed_at TEXT,
     cancelled_at TEXT,
@@ -37,6 +38,31 @@ WHERE status = 'ACTIVE';
 def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(CREATE_TICKET_SEARCHES_SQL)
     conn.execute(CREATE_ONE_ACTIVE_INDEX_SQL)
+    # Idempotent migration: ensure all expected columns exist for old DBs
+    try:
+        cur = conn.execute("PRAGMA table_info(ticket_searches)")
+        existing = {row[1] for row in cur.fetchall()}
+        expected_cols = {
+            "last_checked_at": "TEXT",
+            "last_successful_check_at": "TEXT",
+            "next_check_at": "TEXT",
+            "tcdd_outage_notified": "INTEGER NOT NULL DEFAULT 0 CHECK (tcdd_outage_notified IN (0,1))",
+            "last_tcdd_error_at": "TEXT",
+            "found_trains_json": "TEXT",
+            "found_at": "TEXT",
+            "completed_at": "TEXT",
+            "cancelled_at": "TEXT",
+            "expired_at": "TEXT",
+        }
+        for col, col_def in expected_cols.items():
+            if col not in existing:
+                try:
+                    conn.execute(f"ALTER TABLE ticket_searches ADD COLUMN {col} {col_def}")
+                except Exception:
+                    # column may have been added concurrently; ignore
+                    pass
+    except Exception:
+        pass
     conn.commit()
 
 

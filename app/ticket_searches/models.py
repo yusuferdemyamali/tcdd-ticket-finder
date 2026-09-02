@@ -28,6 +28,7 @@ class TicketSearch:
     next_check_at: str | None = None
     tcdd_outage_notified: bool = False
     last_tcdd_error_at: str | None = None
+    found_trains_json: str | None = None
     found_at: str | None = None
     completed_at: str | None = None
     cancelled_at: str | None = None

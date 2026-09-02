@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import sqlite3
 from zoneinfo import ZoneInfo
 
@@ -119,13 +120,18 @@ class TicketSearchService:
         if new not in allowed:
             raise TicketSearchTransitionError(f"invalid transition {old.value} -> {new.value}")
 
-    def mark_found(self, search_id: int) -> TicketSearch:
+    def mark_found(self, search_id: int, trains=None) -> TicketSearch:
         s = self.get_search(search_id)
         self._validate_transition(s.status, TicketSearchStatus.FOUND)
         s.status = TicketSearchStatus.FOUND
         now_iso = self._now_iso()
         s.found_at = now_iso
         s.updated_at = now_iso
+        if trains is not None:
+            try:
+                s.found_trains_json = self._serialize_trains(trains)
+            except Exception:
+                pass
         try:
             return self._repo.update(s)
         except sqlite3.IntegrityError as e:
@@ -185,6 +191,11 @@ class TicketSearchService:
         s.completed_at = None
         s.cancelled_at = None
         s.expired_at = None
+        s.found_trains_json = None
+        # Reset monitoring outage state for fresh polling run
+        s.tcdd_outage_notified = False
+        s.last_tcdd_error_at = None
+        s.next_check_at = None
         s.updated_at = self._now_iso()
         try:
             return self._repo.update(s)
@@ -225,9 +236,10 @@ class TicketSearchService:
                     status,
                     last_checked_at, last_successful_check_at, next_check_at,
                     tcdd_outage_notified, last_tcdd_error_at,
+                    found_trains_json,
                     found_at, completed_at, cancelled_at, expired_at,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(origin_station_id),
@@ -242,6 +254,7 @@ class TicketSearchService:
                     None,
                     None,
                     0,
+                    None,
                     None,
                     None,
                     None,
@@ -274,6 +287,139 @@ class TicketSearchService:
             except Exception:
                 pass
             raise
+
+    # --- Monitoring metadata durable updates ---
+
+    def record_check_attempt(self, search_id: int) -> TicketSearch:
+        s = self.get_search(search_id)
+        s.last_checked_at = self._now_iso()
+        s.updated_at = self._now_iso()
+        return self._repo.update(s)
+
+    def record_successful_check(self, search_id: int) -> TicketSearch:
+        s = self.get_search(search_id)
+        now_iso = self._now_iso()
+        s.last_checked_at = now_iso
+        s.last_successful_check_at = now_iso
+        s.updated_at = now_iso
+        return self._repo.update(s)
+
+    def record_tcdd_error(self, search_id: int) -> TicketSearch:
+        s = self.get_search(search_id)
+        now_iso = self._now_iso()
+        s.last_checked_at = now_iso
+        s.last_tcdd_error_at = now_iso
+        s.updated_at = now_iso
+        return self._repo.update(s)
+
+    def set_next_check_at(self, search_id: int, next_check_at: str) -> TicketSearch:
+        s = self.get_search(search_id)
+        s.next_check_at = next_check_at
+        s.updated_at = self._now_iso()
+        return self._repo.update(s)
+
+    def set_last_checked_at(self, search_id: int, value: str | None) -> TicketSearch:
+        s = self.get_search(search_id)
+        s.last_checked_at = value
+        s.updated_at = self._now_iso()
+        return self._repo.update(s)
+
+    def set_last_successful_check_at(self, search_id: int, value: str | None) -> TicketSearch:
+        s = self.get_search(search_id)
+        s.last_successful_check_at = value
+        s.updated_at = self._now_iso()
+        return self._repo.update(s)
+
+    def set_last_tcdd_error_at(self, search_id: int, value: str | None) -> TicketSearch:
+        s = self.get_search(search_id)
+        s.last_tcdd_error_at = value
+        s.updated_at = self._now_iso()
+        return self._repo.update(s)
+
+    def set_tcdd_outage_notified(self, search_id: int, notified: bool) -> TicketSearch:
+        s = self.get_search(search_id)
+        s.tcdd_outage_notified = bool(notified)
+        s.updated_at = self._now_iso()
+        return self._repo.update(s)
+
+    def clear_tcdd_outage(self, search_id: int) -> TicketSearch:
+        return self.set_tcdd_outage_notified(search_id, False)
+
+    # --- Found event durable data ---
+
+    def _serialize_trains(self, trains) -> str:
+        data = []
+        for t in trains:
+            try:
+                dep_iso = t.departure_at.isoformat() if hasattr(t.departure_at, "isoformat") else str(t.departure_at)
+                arr_iso = t.arrival_at.isoformat() if hasattr(t.arrival_at, "isoformat") else str(t.arrival_at)
+            except Exception:
+                continue
+            data.append(
+                {
+                    "train_id": t.train_id,
+                    "train_name": t.train_name,
+                    "train_number": t.train_number,
+                    "departure_at": dep_iso,
+                    "arrival_at": arr_iso,
+                    "economy_available": int(t.economy_available),
+                }
+            )
+        return json.dumps(data, ensure_ascii=False)
+
+    def _deserialize_trains(self, json_str: str | None):
+        if not json_str:
+            return []
+        try:
+            raw = json.loads(json_str)
+        except Exception:
+            return []
+        # Return list of simple objects without importing tcdd to keep domain decoupled
+        # Use lightweight namespace objects with required attributes for monitoring/notifier
+        result = []
+        for d in raw:
+            try:
+                dep = datetime.datetime.fromisoformat(d["departure_at"])
+                arr = datetime.datetime.fromisoformat(d["arrival_at"])
+                if dep.tzinfo is None:
+                    dep = dep.replace(tzinfo=ISTANBUL_TZ)
+                if arr.tzinfo is None:
+                    arr = arr.replace(tzinfo=ISTANBUL_TZ)
+                # Create simple object with same interface as TrainAvailability
+                obj = type("FoundTrain", (), {})()
+                obj.train_id = d["train_id"]
+                obj.train_name = d["train_name"]
+                obj.train_number = d["train_number"]
+                obj.departure_at = dep
+                obj.arrival_at = arr
+                obj.economy_available = int(d["economy_available"])
+                # Provide computed properties departure_time/date similar to model
+                obj.departure_date = dep.strftime("%Y-%m-%d")
+                obj.departure_time = dep.strftime("%H:%M")
+                obj.arrival_time = arr.strftime("%H:%M")
+                result.append(obj)
+            except Exception:
+                continue
+        return result
+
+    def persist_found_trains(self, search_id: int, trains) -> TicketSearch:
+        """Persist normalized train fields for found-event retry before notification."""
+        s = self.get_search(search_id)
+        s.found_trains_json = self._serialize_trains(trains)
+        s.updated_at = self._now_iso()
+        return self._repo.update(s)
+
+    def get_found_trains(self, search_id: int):
+        s = self.get_search(search_id)
+        return self._deserialize_trains(s.found_trains_json)
+
+    def get_found_trains_for_search(self, search: TicketSearch):
+        return self._deserialize_trains(search.found_trains_json)
+
+    # --- Recovery lookup ---
+
+    def list_recovery_searches(self) -> list[TicketSearch]:
+        return self._repo.list_recovery()
 
     def is_departure_in_window(self, search: TicketSearch, departure_time: str) -> bool:
         return search.is_departure_in_window(departure_time)

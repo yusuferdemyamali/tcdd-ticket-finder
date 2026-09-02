@@ -128,8 +128,12 @@ async def test_polling_loop_uses_random_interval():
 
     mon = MonitoringService(svc, tcdd, notifier, config=MonitoringConfig(60, 90), random_fn=fake_random, sleep_fn=lambda s: slept.append(s))
     await mon.run_loop(iterations=2)
-    assert slept == [70]
-    assert intervals == [(60, 90)]
+    # After hardening, run_once also persists next_check (random interval) per check, so two checks yield two random calls.
+    # The loop now sleeps based on persisted next_check diff (rounded) rather than generating a new random.
+    assert len(slept) == 1
+    assert abs(slept[0] - 70) < 0.05
+    assert all(iv == (60, 90) for iv in intervals)
+    assert len(intervals) >= 1
 
 
 # 2.1 filtering

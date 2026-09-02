@@ -175,6 +175,50 @@ def format_restart_success() -> str:
     return "✅ Arama yeniden başlatıldı. TCDD 60–90 saniyelik aralıklarla kontrol edilecek."
 
 
+def format_tcdd_outage_message(search: TicketSearch | None = None) -> str:
+    # Generic outage: TCDD cannot be queried, retries will continue in background
+    # Must not include secret token values
+    lines = [
+        "⚠️ TCDD şu anda sorgulanamıyor.",
+        "",
+        "Bağlantı sorunu nedeniyle seferler kontrol edilemedi.",
+        "Arka planda yeniden denenecek.",
+    ]
+    if search is not None:
+        dep_date_display = format_display_date(search.travel_date)
+        route = f"{search.origin_station_name} → {search.destination_station_name}"
+        lines.extend(["", f"🚉 {route}", f"📅 {dep_date_display}"])
+    return "\n".join(lines)
+
+
+def format_tcdd_auth_outage_message(search: TicketSearch | None = None) -> str:
+    # Authentication-specific outage: token may need refresh, no secret values
+    lines = [
+        "⚠️ TCDD oturum bilgisi yenilenmesi gerekiyor.",
+        "",
+        "TCDD token bilgisi yenilenmeli. Yetkilendirme hatası alındı.",
+        "Arka planda yeniden denenecek.",
+    ]
+    if search is not None:
+        dep_date_display = format_display_date(search.travel_date)
+        route = f"{search.origin_station_name} → {search.destination_station_name}"
+        lines.extend(["", f"🚉 {route}", f"📅 {dep_date_display}"])
+    return "\n".join(lines)
+
+
+def format_tcdd_recovery_message(search: TicketSearch | None = None) -> str:
+    lines = [
+        "✅ TCDD bağlantısı yeniden sağlandı.",
+        "",
+        "Bilet araması devam ediyor.",
+    ]
+    if search is not None:
+        dep_date_display = format_display_date(search.travel_date)
+        route = f"{search.origin_station_name} → {search.destination_station_name}"
+        lines.extend(["", f"🚉 {route}", f"📅 {dep_date_display}"])
+    return "\n".join(lines)
+
+
 def build_found_keyboard(search_id: int):
     """Build InlineKeyboard for found ticket: TCDD link + restart callback."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup

@@ -7,6 +7,16 @@ from app.database import init_db
 from .models import TicketSearch, TicketSearchStatus
 
 
+def _get_col(row: sqlite3.Row, name: str, default=None):
+    try:
+        # sqlite3.Row raises IndexError if column missing
+        return row[name]
+    except (IndexError, KeyError):
+        return default
+    except Exception:
+        return default
+
+
 def _row_to_search(row: sqlite3.Row) -> TicketSearch:
     return TicketSearch(
         id=row["id"],
@@ -18,15 +28,16 @@ def _row_to_search(row: sqlite3.Row) -> TicketSearch:
         departure_time_from=row["departure_time_from"],
         departure_time_to=row["departure_time_to"],
         status=TicketSearchStatus(row["status"]),
-        last_checked_at=row["last_checked_at"],
-        last_successful_check_at=row["last_successful_check_at"],
-        next_check_at=row["next_check_at"],
-        tcdd_outage_notified=bool(row["tcdd_outage_notified"]),
-        last_tcdd_error_at=row["last_tcdd_error_at"],
-        found_at=row["found_at"],
-        completed_at=row["completed_at"],
-        cancelled_at=row["cancelled_at"],
-        expired_at=row["expired_at"],
+        last_checked_at=_get_col(row, "last_checked_at"),
+        last_successful_check_at=_get_col(row, "last_successful_check_at"),
+        next_check_at=_get_col(row, "next_check_at"),
+        tcdd_outage_notified=bool(_get_col(row, "tcdd_outage_notified", 0)),
+        last_tcdd_error_at=_get_col(row, "last_tcdd_error_at"),
+        found_trains_json=_get_col(row, "found_trains_json"),
+        found_at=_get_col(row, "found_at"),
+        completed_at=_get_col(row, "completed_at"),
+        cancelled_at=_get_col(row, "cancelled_at"),
+        expired_at=_get_col(row, "expired_at"),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -49,9 +60,10 @@ class TicketSearchRepository:
                     status,
                     last_checked_at, last_successful_check_at, next_check_at,
                     tcdd_outage_notified, last_tcdd_error_at,
+                    found_trains_json,
                     found_at, completed_at, cancelled_at, expired_at,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     search.origin_station_id,
@@ -67,6 +79,7 @@ class TicketSearchRepository:
                     search.next_check_at,
                     1 if search.tcdd_outage_notified else 0,
                     search.last_tcdd_error_at,
+                    search.found_trains_json,
                     search.found_at,
                     search.completed_at,
                     search.cancelled_at,
@@ -129,6 +142,7 @@ class TicketSearchRepository:
                     next_check_at = ?,
                     tcdd_outage_notified = ?,
                     last_tcdd_error_at = ?,
+                    found_trains_json = ?,
                     found_at = ?,
                     completed_at = ?,
                     cancelled_at = ?,
@@ -151,6 +165,7 @@ class TicketSearchRepository:
                     search.next_check_at,
                     1 if search.tcdd_outage_notified else 0,
                     search.last_tcdd_error_at,
+                    search.found_trains_json,
                     search.found_at,
                     search.completed_at,
                     search.cancelled_at,
@@ -174,4 +189,11 @@ class TicketSearchRepository:
 
     def list_all(self) -> list[TicketSearch]:
         cur = self.conn.execute("SELECT * FROM ticket_searches ORDER BY id")
+        return [_row_to_search(r) for r in cur.fetchall()]
+
+    def list_recovery(self) -> list[TicketSearch]:
+        """Return ACTIVE and FOUND searches for monitoring recovery. Exclude terminal states."""
+        cur = self.conn.execute(
+            "SELECT * FROM ticket_searches WHERE status IN ('ACTIVE','FOUND') ORDER BY id"
+        )
         return [_row_to_search(r) for r in cur.fetchall()]

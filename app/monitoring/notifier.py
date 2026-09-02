@@ -9,6 +9,9 @@ from app.telegram.formatting import (
     build_found_keyboard,
     format_expired_message,
     format_found_tickets_message,
+    format_tcdd_auth_outage_message,
+    format_tcdd_outage_message,
+    format_tcdd_recovery_message,
 )
 
 
@@ -21,6 +24,14 @@ class NotifierProtocol(Protocol):
     async def notify_found(self, search: TicketSearch, trains: list[TrainAvailability]) -> None: ...
 
     async def notify_expired(self, search: TicketSearch) -> None: ...
+
+    async def notify_outage(self, search: TicketSearch) -> None: ...
+
+    async def notify_auth_outage(self, search: TicketSearch) -> None: ...
+
+    async def notify_recovery(self, search: TicketSearch) -> None: ...
+
+    async def notify_found_retry(self, search: TicketSearch, trains: list[TrainAvailability]) -> None: ...
 
 
 class TelegramNotifier:
@@ -38,6 +49,24 @@ class TelegramNotifier:
     async def notify_expired(self, search: TicketSearch) -> None:
         text = format_expired_message(search)
         await self._bot.send_message(chat_id=self._chat_id, text=text)
+
+    async def notify_outage(self, search: TicketSearch) -> None:
+        text = format_tcdd_outage_message(search)
+        await self._bot.send_message(chat_id=self._chat_id, text=text)
+
+    async def notify_auth_outage(self, search: TicketSearch) -> None:
+        text = format_tcdd_auth_outage_message(search)
+        await self._bot.send_message(chat_id=self._chat_id, text=text)
+
+    async def notify_recovery(self, search: TicketSearch) -> None:
+        text = format_tcdd_recovery_message(search)
+        await self._bot.send_message(chat_id=self._chat_id, text=text)
+
+    async def notify_found_retry(self, search: TicketSearch, trains: list[TrainAvailability]) -> None:
+        # Retry uses same formatting as found but emphasizes persisted retry
+        text = format_found_tickets_message(search, trains)
+        keyboard = build_found_keyboard(search.id)  # type: ignore[arg-type]
+        await self._bot.send_message(chat_id=self._chat_id, text=text, reply_markup=keyboard)
 
     # synchronous aliases for convenience if monitoring loop is sync
     def notify_found_sync(self, search: TicketSearch, trains: list[TrainAvailability]):  # pragma: no cover
