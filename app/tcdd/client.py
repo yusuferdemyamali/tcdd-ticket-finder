@@ -27,6 +27,46 @@ TRAIN_AVAIL_URL_PRIMARY = "https://gise-api-prod-ytp.tcddtasimacilik.gov.tr/tms/
 TRAIN_AVAIL_URL_FALLBACK = "https://web-api-prod-ytp.tcddtasimacilik.gov.tr/tms/train/train-availability"
 
 
+def _is_cloudflare_signal(resp: Any | None) -> bool:
+    """Detect Cloudflare challenge/WAF block (must not be classified as auth).
+
+    Auth 403 is JSON {"status":403,"error":"Forbidden"}. Cloudflare is HTML
+    with cf-ray / challenge markers or server: cloudflare header.
+    """
+    if resp is None:
+        return False
+    try:
+        body = (getattr(resp, "text", "") or "").lower()
+    except Exception:
+        body = ""
+    if not body:
+        return False
+    markers = (
+        "just a moment",
+        "verify you are human",
+        "attention required",
+        "cf-challenge",
+        "cf_ray",
+        "cf-ray",
+        "cloudflare",
+        "challenges.cloudflare.com",
+        "turnstile",
+    )
+    if any(m in body for m in markers):
+        return True
+    try:
+        headers = getattr(resp, "headers", {}) or {}
+        # httpx headers are case-insensitive; normalize
+        lower_headers = {str(k).lower(): str(v).lower() for k, v in dict(headers).items()}
+        if "cf-ray" in lower_headers or "cf-mitigated" in lower_headers:
+            return True
+        if lower_headers.get("server") == "cloudflare":
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _is_tls_waf_signal(exc: Exception, resp: Any | None) -> bool:
     msg = str(exc).lower() if exc else ""
     if resp is not None:
@@ -37,6 +77,8 @@ def _is_tls_waf_signal(exc: Exception, resp: Any | None) -> bool:
         except Exception:
             pass
         if status == 403 and "nginx" in body.lower():
+            return True
+        if _is_cloudflare_signal(resp):
             return True
     if any(k in msg for k in ("tls", "ssl", "certificate", "handshake", "fingerprint")):
         return True
@@ -219,6 +261,8 @@ class TcddClient:
             body = resp.text[:500] if hasattr(resp, "text") else ""
             if resp.status_code == 403 and "nginx" in body.lower():
                 raise TcddTlsError(f"403 nginx WAF – {body[:300]}")
+            if _is_cloudflare_signal(resp):
+                raise TcddWafError(f"403 Cloudflare WAF – {body[:300]}")
             raise TcddAuthenticationError(f"HTTP {resp.status_code}: {body[:500]}")
         if resp.status_code == 429:
             raise TcddRateLimitError(f"HTTP 429: {resp.text[:500]}")
@@ -372,6 +416,8 @@ class TcddClient:
             body = resp.text[:800] if hasattr(resp, "text") else ""
             if resp.status_code == 403 and "nginx" in body.lower():
                 raise TcddWafError(f"403 nginx WAF – {body[:300]}")
+            if _is_cloudflare_signal(resp):
+                raise TcddWafError(f"403 Cloudflare WAF – {body[:300]}")
             # Also treat 403 without nginx as auth per spec? But distinguish TLS
             if _is_tls_waf_signal(Exception(body), resp):
                 raise TcddTlsError(f"HTTP {resp.status_code} TLS/WAF: {body[:300]}")
@@ -433,6 +479,8 @@ class TcddClient:
             if status == 401 or status == 403:
                 if status == 403 and "nginx" in body.lower():
                     raise TcddWafError(f"403 nginx WAF via curl_cffi: {body[:300]}")
+                if _is_cloudflare_signal(resp):
+                    raise TcddWafError(f"403 Cloudflare WAF via curl_cffi: {body[:300]}")
                 raise TcddAuthenticationError(f"HTTP {status} via curl_cffi: {body[:500]}")
             if status == 429:
                 raise TcddRateLimitError(f"HTTP 429 via curl_cffi: {body[:500]}")
